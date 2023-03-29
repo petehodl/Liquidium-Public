@@ -1,7 +1,6 @@
 
-;;;; liquidium-megapont-ape-club-vault-v1-1-2
+;;;; liquidium-megapont-vault-v1-5
 ;;;; nft: megapont-ape-club-nft
-;;;; network: testnet
 ;;;; Manages loans and auctions for megapont ape club nft assets as collateral
 ;;;; Offical website that calls the public functions can be found here:
 ;;;; https://liquidium.finance/
@@ -9,9 +8,8 @@
 ;;;; Constant definitions
 
 ;;; Standard principal that deployed contract
-;; (define-constant DEPLOYER_ACCOUNT tx-sender) 
-(define-constant DEPLOYER_ACCOUNT 'ST2M5284BRBR3AVZXR2GD17AFZ6VKJ2ERH123XMVD) ;; TODO: only for testing
-
+(define-constant DEPLOYER_ACCOUNT tx-sender)
+(define-constant LIQUIDIUM_ACCOUNT 'SPYHY9MV6S08YJQVW0R400ADXZBBJ0GM096BMY34.liquidium-profits)
 
 ;;; Error codes
 (define-constant ERR_AUCTION_INACTIVE (err u1000))
@@ -24,6 +22,7 @@
 (define-constant ERR_TERM_INVALID (err u3001))
 (define-constant ERR_VALUE_INVALID (err u3002))
 (define-constant ERR_ACCOUNT_INVALID (err u3003))
+(define-constant ERR_INPUT_INVALID (err u3004))
 
 (define-constant ERR_ASSET_TRANSFER_FAILED (err u4000))
 (define-constant ERR_STX_TRANSFER_FAILED (err u4001))
@@ -32,42 +31,32 @@
 (define-constant ERR_LOAN_EXPIRED (err u5001))
 
 (define-constant ERR_MAX_ACTIVE_LOANS_REACHED (err u6000))
+(define-constant ERR_INSUFFICIENT_LIQUIDITY (err u6001))
+(define-constant ERR_ON_APPEND (err u6002))
 
 (define-constant ERR_ASSET_NOT_OWNED (err u7000))
 
 (define-constant ERR_NOT_ALLOWED (err u9999))
 
 ;;;; Data variable definitions
-
-;;; Standard principal that calls public function (maintenance)
-(define-data-var maintenanceAccount principal DEPLOYER_ACCOUNT)
-
-;; uint values used in calculations and expressions within private and public functions
-(define-data-var loanToAssetRatio uint u2500) ;; as basis points ;; 2500 bp = 25 percent
-(define-data-var loanLiquidationThreshhold uint u3500) ;; as basis points ;; 3500 bp = 35 percent
+(define-data-var loanToAssetRatio uint u3500) ;; as basis points ;; 2500 bp = 25 percent
+(define-data-var loanLiquidationThreshhold uint u4500) ;; as basis points ;; 3500 bp = 35 percent
 (define-data-var loanFeeRate uint u50) ;; as basis points ;; 50 bp = 0.5 percent
-;; (define-data-var loanInterestPeriod uint u52560) ;; as blocks ;; 52560 ~= 365 days
-(define-data-var loanInterestPeriod uint u4380) ;; TODO: this is correct one? ;; as blocks ;; 4380 ~= 30 days
-;; (define-data-var loanTermLengthMin uint u1008) ;; as blocks ;; 1008 ~= 7 days
-(define-data-var loanTermLengthMax uint u13104) ;; as blocks ;; 13104 ~= 91 days
-;; (define-data-var auctionDuration uint u144) ;; as blocks ;; 144 ~= 24 hours
-
-(define-data-var loanTermLengthMin uint u5) ;; TODO: only for testing
-(define-data-var auctionDuration uint u5) ;; TODO: only for testing
-
-(define-data-var loanTermInterestRates (list 20 {termLengthMin: uint, interestRate: uint})
+(define-data-var loanTermLengthMax uint u4380) ;; as blocks ;; 4380 ~= 30 days
+(define-data-var loanTermLengthMin uint u1008) ;; as blocks ;; 1008 ~= 7 days
+(define-data-var auctionDuration uint u144) ;; as blocks ;; 144 ~= 24 hours
+(define-data-var loanTermInterestRates (list 5 {termLengthMin: uint, interestRate: uint})
     (list
-        ;; {termLengthMin: u1008, interestRate: u500}
-        {termLengthMin: u0, interestRate: u500} ;; TODO: consider keeping this
-        {termLengthMin: u1152, interestRate: u600}
-        {termLengthMin: u2160, interestRate: u700}
-        {termLengthMin: u4464, interestRate: u800}
-        {termLengthMin: u8784, interestRate: u900}
+        {termLengthMin: u0, interestRate: u300}
+        {termLengthMin: u1152, interestRate: u400}
+        {termLengthMin: u2160, interestRate: u500}
+        {termLengthMin: u3168, interestRate: u600}
+        {termLengthMin: u4176, interestRate: u700}
     )
 )
 
-;; uint values updated in public function (maintenance)
-(define-data-var lastMaintenanceCallBlock uint block-height)
+;; available lending capital, prevents lending of auction bids
+(define-data-var vaultLendingLiquidity uint u0)
 
 ;; uint value updated in public function (set-asset-floor-value)
 (define-data-var assetFloor uint u1000000) ;; as microstacks ;; 1 microstx = 0.000001 stx
@@ -96,6 +85,9 @@
 ;; list of uint values removed in private function (liquidate-loan)
 (define-data-var activeLoanIds (list 2500 uint) (list ))
 
+;; list of previous 10 asset floor values updated in public function (set-asset-floor)
+(define-data-var assetFloorHistory (list 10 uint) (list ))
+
 ;;;; Map definitions
 
 (define-map Borrower
@@ -113,7 +105,9 @@
     {
         id: uint,
         assetId: uint,
-        debtBalance: uint,
+        principal: uint,
+        interest: uint,
+        debt: uint,
         termInterestRate: uint,
         termEndAt: uint,
     }
@@ -159,10 +153,6 @@
     )
 )
 
-(define-private (uint-list-slice (uintList (list 2500 uint)) (start uint))
-    (get accumulator (fold uint-list-slice-iterator uintList {accumulator: (list ), index: u0, start: start}))
-)
-
 (define-private (uint-list-slice-iterator (value uint) (state {accumulator: (list 10 uint), index: uint, start: uint}))
     (let
         (
@@ -190,6 +180,10 @@
     )
 )
 
+(define-private (uint-list-slice (uintList (list 2500 uint)) (start uint))
+    (get accumulator (fold uint-list-slice-iterator uintList {accumulator: (list ), index: u0, start: start}))
+)
+
 (define-private (close-auction (auctionId uint) (count uint))
     (let
         (
@@ -199,11 +193,17 @@
             (auctionAssetId
                 (get assetId auction)
             )
+            (auctionLastBidAmount
+                (get lastBidAmount auction)
+            )
             (auctionLastBidderAccount
                 (unwrap! (get lastBidderAccount auction) count)
             )
             (auctionEndAt
                 (unwrap! (get endAt auction) count)
+            )
+            (reserveAmount
+                (get reserveAmount auction)
             )
             (eventCount
                 (+ count u1)
@@ -215,8 +215,12 @@
         (asserts! (is-ok (as-contract (contract-call? .megapont-ape-club-nft transfer auctionAssetId tx-sender auctionLastBidderAccount)))
             count
         )
+        (asserts! (is-ok (as-contract (stx-transfer? (- auctionLastBidAmount reserveAmount) tx-sender LIQUIDIUM_ACCOUNT))) ;; leave loan principal in contract and send extra to LIQUIDIUM_ACCOUNT
+            count
+        )
         (var-set tempUint auctionId)
         (var-set activeAuctionIds (filter not-tempUint (var-get activeAuctionIds)))
+        (var-set vaultLendingLiquidity (+ (var-get vaultLendingLiquidity) reserveAmount))
         (print
             {
                 eventName: "close-auction",
@@ -244,7 +248,10 @@
                 (unwrap! (map-get? BorrowerByLoan loanId) count)
             )
             (loanDebtBalance
-                (get debtBalance loan)
+                (get debt loan)
+            )
+            (loanPrincipal
+                (get principal loan)
             )
             (loanTermEndAt
                 (get termEndAt loan)
@@ -261,100 +268,35 @@
                 (+ count u1)
             )
         )
-        (asserts! (or (> block-height loanTermEndAt) (>= loanDebtBalance (var-get loanLiquidationValue)))
+        (asserts! (or (>= block-height loanTermEndAt) (>= loanDebtBalance (var-get loanLiquidationValue)))
             count
         )
-        (begin
-            (var-set tempUint loanId)
-            (var-set activeLoanIds (filter not-tempUint (var-get activeLoanIds)))
-            (map-set Borrower borrowerAccount (filter not-tempUint borrowerActiveLoanIds))
-            (var-set activeAuctionIds (unwrap! (as-max-len? (concat (list auctionId) (var-get activeAuctionIds)) u2500) count))
-            (var-set lastAuctionId auctionId)
-            (map-insert Auction
-                auctionId
-                {
-                    id: auctionId,
-                    assetId: loanAssetId,
-                    reserveAmount: loanDebtBalance,
-                    lastBidAmount: u0,
-                    lastBidderAccount: none,
-                    endAt: none,
-                }
-            )
-            (print
-                {
-                    eventName: "liquidate-loan",
-                    eventCount: eventCount,
-                    loanId: loanId,
-                    assetId: loanAssetId,
-                    debtBalance: loanDebtBalance,
-                    termEndAt: loanTermEndAt,
-                    loanLiquidationValue: (var-get loanLiquidationValue),
-                    auctionId: auctionId
-                }
-            )
-            eventCount
-        )
-    )
-)
-
-(define-private (compound-loan (loanId uint) (count uint))
-    (let
-        (
-            (loan
-                (unwrap! (map-get? Loan loanId) count)
-            )
-            (loanAssetId
-                (get assetId loan)
-            )
-            (loanDebtBalance
-                (get debtBalance loan)
-            )
-            (loanTermInterestRate
-                (get termInterestRate loan)
-            )
-            (loanTermEndAt
-                (get termEndAt loan)
-            )
-            (compoundingInterval
-                (- block-height (var-get lastMaintenanceCallBlock))
-            )
-            (interestAmountPerPeriod
-                (/ (* loanDebtBalance loanTermInterestRate) u10000)
-            )
-            (interestAmountPerBlock
-                    (/ interestAmountPerPeriod (var-get loanInterestPeriod))
-            )
-            (compoundedInterestAmount
-                (* interestAmountPerBlock compoundingInterval)
-            )
-            (compoundedDebtBalance
-                (+ loanDebtBalance compoundedInterestAmount)
-            )
-            (eventCount
-                (+ count u1)
-            )
-        )
-        (map-set Loan
-            loanId
+        (var-set tempUint loanId)
+        (var-set activeLoanIds (filter not-tempUint (var-get activeLoanIds)))
+        (map-set Borrower borrowerAccount (filter not-tempUint borrowerActiveLoanIds))
+        (var-set activeAuctionIds (unwrap! (as-max-len? (concat (list auctionId) (var-get activeAuctionIds)) u2500) count))
+        (var-set lastAuctionId auctionId)
+        (map-insert Auction
+            auctionId
             {
-                id: loanId,
+                id: auctionId,
                 assetId: loanAssetId,
-                debtBalance: compoundedDebtBalance,
-                termInterestRate: loanTermInterestRate,
-                termEndAt: loanTermEndAt,
+                reserveAmount: (if (>= loanPrincipal loanDebtBalance) loanDebtBalance loanPrincipal),
+                lastBidAmount: u0,
+                lastBidderAccount: none,
+                endAt: none,
             }
         )
         (print
             {
-                eventName: "compound-loan",
+                eventName: "liquidate-loan",
                 eventCount: eventCount,
                 loanId: loanId,
                 assetId: loanAssetId,
-                debtBalance: loanDebtBalance,
+                debtBalance: loanPrincipal,
                 termEndAt: loanTermEndAt,
-                compoundedInterestAmount: compoundedInterestAmount,
-                compoundedDebtBalance: compoundedDebtBalance
+                loanLiquidationValue: (var-get loanLiquidationValue),
+                auctionId: auctionId
             }
         )
         eventCount
@@ -390,7 +332,6 @@
                     loanToAssetRatio: (var-get loanToAssetRatio),
                     loanLiquidationThreshhold: (var-get loanLiquidationThreshhold),
                     loanFeeRate: (var-get loanFeeRate),
-                    loanInterestPeriod: (var-get loanInterestPeriod),
                     loanTermLengthMin: (var-get loanTermLengthMin),
                     loanTermLengthMax: (var-get loanTermLengthMax),
                 }
@@ -423,7 +364,8 @@
             (values
                 {
                     loanCount: (len (var-get activeLoanIds)),
-                    auctionCount: (len (var-get activeAuctionIds))
+                    auctionCount: (len (var-get activeAuctionIds)),
+                    vaultLendingLiquidity: (var-get vaultLendingLiquidity),
                 }
             )
         )
@@ -456,20 +398,17 @@
                     (get lastBidderAccount auction)
                 )
                 (auctionEndAt
-                    (match (get endAt auction)
-                        endAt
-                            (begin
-                                (asserts! (< block-height endAt) ERR_AUCTION_ENDED)
-                                endAt
-                            )
-                        (+ block-height (var-get auctionDuration))
+                    (match
+                        (get endAt auction) endAt endAt                  
+                        block-height
                     )
                 )
                 (bidderAccount
                     tx-sender
                 )
             )
-            (asserts! (and (>= amount auctionReserveAmount) (> amount auctionLastBidAmount))
+            (asserts! (<= block-height auctionEndAt) ERR_AUCTION_ENDED)
+            (asserts! (and (> amount auctionReserveAmount) (> amount auctionLastBidAmount))
                 ERR_AMOUNT_INVALID
             )
             (asserts! (not (is-eq bidderAccount (as-contract tx-sender)))
@@ -483,7 +422,7 @@
                     reserveAmount: auctionReserveAmount,
                     lastBidAmount: amount,
                     lastBidderAccount: (some bidderAccount),
-                    endAt: (some auctionEndAt),
+                    endAt: (some (+ block-height (var-get auctionDuration))),
                 }
             )
             (asserts! (>= (stx-get-balance bidderAccount) amount)
@@ -529,37 +468,32 @@
                     (get assetId loan)
                 )
                 (loanDebtBalance
-                    (get debtBalance loan)
+                    (get debt loan)
                 )
-                (loanTermInterestRate
-                    (get termInterestRate loan)
+                (loanPrincipal
+                    (get principal loan)
                 )
                 (loanTermEndAt
                     (get termEndAt loan)
                 )
-                (adjustedPaymentAmount
+                (paymentAmount
                     (if (>= amount loanDebtBalance)
                         loanDebtBalance
                         amount
                     )
                 )
                 (newLoanDebtBalance
-                    (- loanDebtBalance adjustedPaymentAmount)
-                )
-                (paymentRefundAmount
-                    (if (is-eq newLoanDebtBalance u0)
-                        (- amount loanDebtBalance)
-                        u0
-                    )
+                    (- loanDebtBalance paymentAmount)
                 )
                 (borrowerAccount
-                    tx-sender
+                    (unwrap! (map-get? BorrowerByLoan loanId) ERR_LOAN_NOT_FOUND)
                 )
                 (borrowerActiveLoanIds
                     (default-to (list ) (map-get? Borrower borrowerAccount))
                 )
             )
-            (asserts! (> loanTermEndAt block-height) ERR_LOAN_EXPIRED) ;; TODO: test
+            (asserts! (is-eq tx-sender borrowerAccount) ERR_NOT_ALLOWED)
+            (asserts! (> loanTermEndAt block-height) ERR_LOAN_EXPIRED)
             (asserts! (is-some (index-of (default-to (list ) (map-get? Borrower borrowerAccount)) loanId))
                 ERR_NOT_ALLOWED
             )
@@ -568,39 +502,47 @@
                 {
                     id: loanId,
                     assetId: loanAssetId,
-                    debtBalance: newLoanDebtBalance,
-                    termInterestRate: loanTermInterestRate,
+                    principal: loanPrincipal,
+                    interest: (get interest loan),
+                    debt: newLoanDebtBalance,
+                    termInterestRate: (get termInterestRate loan),
                     termEndAt: loanTermEndAt,
                 }
             )
-            (asserts! (>= (stx-get-balance borrowerAccount) amount)
+            (asserts! (>= (stx-get-balance borrowerAccount) paymentAmount)
                 ERR_STX_TRANSFER_FAILED
             )
-            (asserts! (is-ok (stx-transfer? amount borrowerAccount (as-contract tx-sender)))
-                ERR_STX_TRANSFER_FAILED
+            (if (> loanDebtBalance loanPrincipal) ;; if interest is still due
+                (if (>= (- loanDebtBalance loanPrincipal) paymentAmount) ;; if interest due is greater than payment amount
+                    (asserts! (is-ok (stx-transfer? paymentAmount borrowerAccount LIQUIDIUM_ACCOUNT)) ;; then pay part of interest due with all paymentAmount to LIQM ACCOUNT
+                        ERR_STX_TRANSFER_FAILED 
+                    )
+                    (begin
+                        (asserts! (is-ok (stx-transfer? (- loanDebtBalance loanPrincipal) borrowerAccount LIQUIDIUM_ACCOUNT)) ;; else send rest of interest due to LIQM ACCOUNT
+                            ERR_STX_TRANSFER_FAILED
+                        )
+                        (asserts! (is-ok (stx-transfer? (- paymentAmount (- loanDebtBalance loanPrincipal)) borrowerAccount (as-contract tx-sender)))
+                            ERR_STX_TRANSFER_FAILED
+                        )
+                        (var-set vaultLendingLiquidity (+ (var-get vaultLendingLiquidity) (- paymentAmount (- loanDebtBalance loanPrincipal))))
+                    )
+                )
+                (begin
+                    (asserts! (is-ok (stx-transfer? paymentAmount borrowerAccount (as-contract tx-sender))) ;; else no interest due, so send all back to contract
+                        ERR_STX_TRANSFER_FAILED
+                    )
+                    (var-set vaultLendingLiquidity (+ (var-get vaultLendingLiquidity) paymentAmount))
+                )
             )
-
-            ;; TO-DO - Refactor
             (if (is-eq newLoanDebtBalance u0)
                 (begin
                     (var-set tempUint loanId)
                     (var-set activeLoanIds (filter not-tempUint (var-get activeLoanIds)))
                     (map-set Borrower borrowerAccount (filter not-tempUint borrowerActiveLoanIds))
-                    (try! (as-contract (contract-call? .megapont-ape-club-nft transfer loanAssetId tx-sender borrowerAccount)))
-                    (if (> paymentRefundAmount u0)
-                        (begin
-                            (asserts! (>= paymentRefundAmount (stx-get-balance borrowerAccount))
-                               ERR_STX_TRANSFER_FAILED
-                            )
-                            (asserts! (is-ok (stx-transfer? paymentRefundAmount borrowerAccount (as-contract tx-sender)))
-                                ERR_STX_TRANSFER_FAILED
-                            )
-                            (ok true)
-                        )
-                        (ok true)
-                    )
+                    (unwrap! (as-contract (contract-call? .megapont-ape-club-nft transfer loanAssetId tx-sender borrowerAccount)) ERR_ASSET_TRANSFER_FAILED)
+                    (ok true)
                 )
-                (ok true) ;; never used
+                (ok true)
             )
         )
     )
@@ -623,6 +565,12 @@
         )
         (let
             (
+                (borrowerAccount
+                    tx-sender
+                )
+                (borrowerActiveLoanIds
+                    (default-to (list ) (map-get? Borrower borrowerAccount))
+                )
                 (loanId
                     (begin
                         (var-set lastLoanId (+ (var-get lastLoanId) u1))
@@ -641,27 +589,35 @@
                 (loanFeeAmount
                     (/ (* amount (var-get loanFeeRate)) u10000)
                 )
-                (loanWithdrawalAmount
-                    (- amount loanFeeAmount)
+                (interestAmountPerPeriod
+                    (/ (* amount loanTermInterestRate) u10000)
                 )
-                (borrowerAccount
-                    tx-sender
+                (interestAmount
+                    (/ (* interestAmountPerPeriod termLength) (var-get loanTermLengthMax))
                 )
-                (borrowerActiveLoanIds
-                    (default-to (list ) (map-get? Borrower borrowerAccount))
+                (debtBalance
+                    (+ amount interestAmount)
+                )
+                (availableLiquidity
+                    (var-get vaultLendingLiquidity)
                 )
             )
-            (asserts! (>= (stx-get-balance (as-contract tx-sender)) loanWithdrawalAmount)
-                ERR_STX_TRANSFER_FAILED
-            )
-            ;; if error then fail
-            (asserts! (is-ok (as-contract (stx-transfer? loanWithdrawalAmount tx-sender borrowerAccount)))
-                ERR_STX_TRANSFER_FAILED
-            )
-            ;; if error then fail
             (asserts! (is-ok (contract-call? .megapont-ape-club-nft transfer assetId borrowerAccount (as-contract tx-sender)))
                 ERR_ASSET_TRANSFER_FAILED
             )
+            (asserts! (>= (stx-get-balance borrowerAccount) loanFeeAmount)
+                ERR_STX_TRANSFER_FAILED
+            )
+            (asserts! (is-ok (stx-transfer? loanFeeAmount borrowerAccount LIQUIDIUM_ACCOUNT))
+                ERR_STX_TRANSFER_FAILED
+            )
+            (asserts! (>= availableLiquidity amount)
+                ERR_INSUFFICIENT_LIQUIDITY
+            )
+            (asserts! (is-ok (as-contract (stx-transfer? amount tx-sender borrowerAccount)))
+                ERR_STX_TRANSFER_FAILED
+            )
+            (var-set vaultLendingLiquidity (- availableLiquidity amount))
             (map-set Borrower borrowerAccount (unwrap! (as-max-len? (concat (list loanId) borrowerActiveLoanIds) u5) ERR_MAX_ACTIVE_LOANS_REACHED))
             (var-set activeLoanIds (unwrap! (as-max-len? (concat (list loanId) (var-get activeLoanIds)) u2500) ERR_MAX_ACTIVE_LOANS_REACHED))
             (map-insert Loan
@@ -669,7 +625,9 @@
                 {
                     id: loanId,
                     assetId: assetId,
-                    debtBalance: amount,
+                    principal: amount,
+                    interest: interestAmount,
+                    debt: debtBalance,
                     termInterestRate: loanTermInterestRate,
                     termEndAt: loanTermEndAt,
                 }
@@ -687,7 +645,7 @@
 
 (define-read-only (is-admin (account principal))
     (or
-        (is-eq (var-get maintenanceAccount) tx-sender)
+        (is-eq DEPLOYER_ACCOUNT tx-sender)
         (default-to false (map-get? Admin account))
     )
 )
@@ -701,8 +659,34 @@
             )
             ERR_NOT_ALLOWED
         )
-        ;; #[allow(unchecked_data)]
         (ok (map-set Admin account allowed))
+    )
+)
+
+(define-private (remove-first (value uint))
+    (let ((index (+ u1 (var-get tempUint))))
+        (var-set tempUint index)
+        (not (is-eq index u1))
+    )
+)
+
+(define-public (update-asset-floor (amount uint))
+    (let ((currentHistory (var-get assetFloorHistory)))
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (> amount u0)
+            ERR_AMOUNT_INVALID
+        )
+        (var-set tempUint u0)
+        (if (< (len currentHistory) u10)
+            (var-set assetFloorHistory (unwrap! (as-max-len? (append currentHistory amount) u10) ERR_ON_APPEND))
+            (var-set assetFloorHistory (unwrap! (as-max-len? (append (filter remove-first currentHistory) amount) u10) ERR_ON_APPEND))
+        )
+        (var-set assetFloor (/ (fold + (var-get assetFloorHistory) u0) (len (var-get assetFloorHistory))))
+        (var-set loanAmountMax (/ (* (var-get loanToAssetRatio) (var-get assetFloor)) u10000))
+        (var-set loanLiquidationValue (/ (* (var-get loanLiquidationThreshhold) (var-get assetFloor)) u10000))
+        (ok (var-get assetFloor))
     )
 )
 
@@ -710,23 +694,16 @@
     (begin
         (fold close-auction (var-get activeAuctionIds) u0)
         (fold liquidate-loan (var-get activeLoanIds) u0)
-        (fold compound-loan (var-get activeLoanIds) u0)
-        (var-set lastMaintenanceCallBlock block-height)
         (ok true)
     )
 )
 
-(define-public (set-assetFloor (amount uint))
+(define-public (set-lending-liquidity (amount uint))
     (begin
         (asserts! (is-admin tx-sender)
             ERR_NOT_ALLOWED
         )
-        (asserts! (> amount u0)
-            ERR_AMOUNT_INVALID
-        )
-        (var-set assetFloor amount)
-        (var-set loanAmountMax (/ (* (var-get loanToAssetRatio) amount) u10000))
-        (var-set loanLiquidationValue (/ (* (var-get loanLiquidationThreshhold) amount) u10000))
+        (var-set vaultLendingLiquidity amount)
         (ok true)
     )
 )
@@ -742,6 +719,7 @@
         (asserts! (is-ok (stx-transfer? amount tx-sender (as-contract tx-sender)))
             ERR_STX_TRANSFER_FAILED
         )
+        (var-set vaultLendingLiquidity (+ (var-get vaultLendingLiquidity) amount))
         (ok true)
     )
 )
@@ -754,9 +732,105 @@
         (asserts! (and (> amount u0) (>= (stx-get-balance (as-contract tx-sender)) amount))
             ERR_AMOUNT_INVALID
         )
-        (asserts! (is-ok (as-contract (stx-transfer? amount tx-sender DEPLOYER_ACCOUNT)))
+        (asserts! (is-ok (as-contract (stx-transfer? amount tx-sender LIQUIDIUM_ACCOUNT)))
             ERR_STX_TRANSFER_FAILED
         )
+        (var-set vaultLendingLiquidity (- (var-get vaultLendingLiquidity) amount))
+        (ok true)
+    )
+)
+
+(define-public (withdrawl-megapont (id uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (unwrap! (as-contract (contract-call? .megapont-ape-club-nft transfer id tx-sender LIQUIDIUM_ACCOUNT)) ERR_ASSET_TRANSFER_FAILED)
+        (ok true)
+    )
+)
+
+(define-public (set-loanToAssetRatio (ratio uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (and (> ratio u0) (<= ratio u10000))
+            ERR_INPUT_INVALID
+        )
+        (var-set loanToAssetRatio ratio)
+        (var-set loanAmountMax (/ (* (var-get loanToAssetRatio) (var-get assetFloor)) u10000))
+        (ok true)
+    )
+)
+
+(define-public (set-loanLiquidationThreshhold (ratio uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (and (> ratio u0) (<= ratio u10000) (>= ratio (var-get loanToAssetRatio)))
+            ERR_INPUT_INVALID
+        )
+        (var-set loanLiquidationThreshhold ratio)
+        (var-set loanLiquidationValue (/ (* (var-get loanLiquidationThreshhold) (var-get assetFloor)) u10000))
+        (ok true)
+    )
+)
+
+(define-public (set-loanFeeRate (rate uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (and (> rate u0) (<= rate u500))
+            ERR_INPUT_INVALID
+        )
+        (var-set loanFeeRate rate)
+        (ok true)
+    )
+)
+
+(define-public (set-loanTermLengthMax (max uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (>= max (var-get loanTermLengthMin)) ERR_INPUT_INVALID)
+        (var-set loanTermLengthMax max)
+        (ok true)
+    )
+)
+
+(define-public (set-loanTermLengthMin (min uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (<= min (var-get loanTermLengthMax)) ERR_INPUT_INVALID)
+        (var-set loanTermLengthMin min)
+        (ok true)
+    )
+)
+
+(define-public (set-auctionDuration (duration uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (>= duration u0) ERR_INPUT_INVALID)
+        (var-set auctionDuration duration)
+        (ok true)
+    )
+)
+
+(define-public (set-loanTermInterestRates (rates (list 5 (tuple (interestRate uint) (termLengthMin uint)))))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (is-eq (len rates) u5) ERR_INPUT_INVALID)
+        (var-set loanTermInterestRates rates)
         (ok true)
     )
 )

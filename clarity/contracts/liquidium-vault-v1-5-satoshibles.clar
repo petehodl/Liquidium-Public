@@ -1,7 +1,7 @@
 
-;;;; liquidium-megapont-ape-club-vault-v1-1-4
-;;;; nft: megapont-ape-club-nft
-;;;; Manages loans and auctions for megapont ape club nft assets as collateral
+;;;; liquidium-vault-v1-5-satoshibles
+;;;; nft: the-guests
+;;;; Manages loans and auctions for the-guests assets as collateral
 ;;;; Offical website that calls the public functions can be found here:
 ;;;; https://liquidium.finance/
 
@@ -9,7 +9,8 @@
 
 ;;; Standard principal that deployed contract
 (define-constant DEPLOYER_ACCOUNT tx-sender)
-(define-constant LIQUIDIUM_ACCOUNT 'SPYHY9MV6S08YJQVW0R400ADXZBBJ0GM096BMY34.liquidium-profits)
+(define-constant LIQUIDIUM_PROFITS 'SPYHY9MV6S08YJQVW0R400ADXZBBJ0GM096BMY34.liquidium-profits)
+(define-constant LIQUIDIUM 'SPYHY9MV6S08YJQVW0R400ADXZBBJ0GM096BMY34)
 
 ;;; Error codes
 (define-constant ERR_AUCTION_INACTIVE (err u1000))
@@ -22,6 +23,7 @@
 (define-constant ERR_TERM_INVALID (err u3001))
 (define-constant ERR_VALUE_INVALID (err u3002))
 (define-constant ERR_ACCOUNT_INVALID (err u3003))
+(define-constant ERR_INPUT_INVALID (err u3004))
 
 (define-constant ERR_ASSET_TRANSFER_FAILED (err u4000))
 (define-constant ERR_STX_TRANSFER_FAILED (err u4001))
@@ -37,24 +39,22 @@
 
 (define-constant ERR_NOT_ALLOWED (err u9999))
 
-;; Constants
-(define-constant loanToAssetRatio u2500) ;; as basis points ;; 2500 bp = 25 percent
-(define-constant loanLiquidationThreshhold u3500) ;; as basis points ;; 3500 bp = 35 percent
-(define-constant loanFeeRate u50) ;; as basis points ;; 50 bp = 0.5 percent
-(define-constant loanTermLengthMax u4380) ;; as blocks ;; 4380 ~= 30 days
-(define-constant loanTermLengthMin u1008) ;; as blocks ;; 1008 ~= 7 days
-(define-constant auctionDuration u144) ;; as blocks ;; 144 ~= 24 hours
-(define-constant loanTermInterestRates
+;;;; Data variable definitions
+(define-data-var loanToAssetRatio uint u3500) ;; as basis points ;; 2500 bp = 25 percent
+(define-data-var loanLiquidationThreshhold uint u4500) ;; as basis points ;; 3500 bp = 35 percent
+(define-data-var loanFeeRate uint u50) ;; as basis points ;; 50 bp = 0.5 percent
+(define-data-var loanTermLengthMax uint u4380) ;; as blocks ;; 4380 ~= 30 days
+(define-data-var loanTermLengthMin uint u1008) ;; as blocks ;; 1008 ~= 7 days
+(define-data-var auctionDuration uint u144) ;; as blocks ;; 144 ~= 24 hours
+(define-data-var loanTermInterestRates (list 5 {termLengthMin: uint, interestRate: uint})
     (list
-        {termLengthMin: u0, interestRate: u500}
-        {termLengthMin: u1152, interestRate: u600}
-        {termLengthMin: u2160, interestRate: u700}
-        {termLengthMin: u3168, interestRate: u800}
-        {termLengthMin: u4176, interestRate: u900}
+        {termLengthMin: u0, interestRate: u300}
+        {termLengthMin: u1152, interestRate: u400}
+        {termLengthMin: u2160, interestRate: u500}
+        {termLengthMin: u3168, interestRate: u600}
+        {termLengthMin: u4176, interestRate: u700}
     )
 )
-
-;;;; Data variable definitions
 
 ;; available lending capital, prevents lending of auction bids
 (define-data-var vaultLendingLiquidity uint u0)
@@ -154,10 +154,6 @@
     )
 )
 
-(define-private (uint-list-slice (uintList (list 2500 uint)) (start uint))
-    (get accumulator (fold uint-list-slice-iterator uintList {accumulator: (list ), index: u0, start: start}))
-)
-
 (define-private (uint-list-slice-iterator (value uint) (state {accumulator: (list 10 uint), index: uint, start: uint}))
     (let
         (
@@ -183,6 +179,10 @@
                 (+ index u1)
         }
     )
+)
+
+(define-private (uint-list-slice (uintList (list 2500 uint)) (start uint))
+    (get accumulator (fold uint-list-slice-iterator uintList {accumulator: (list ), index: u0, start: start}))
 )
 
 (define-private (close-auction (auctionId uint) (count uint))
@@ -213,11 +213,10 @@
         (asserts! (> block-height auctionEndAt)
             count
         )
-        ;; (asserts! (is-ok (as-contract (contract-call? 'SP3D6PV2ACBPEKYJTCMH7HEN02KP87QSP8KTEH335.megapont-ape-club-nft transfer auctionAssetId tx-sender auctionLastBidderAccount)))
-        (asserts! (is-ok (as-contract (contract-call? .megapont-ape-club-nft transfer auctionAssetId tx-sender auctionLastBidderAccount)))
+        (asserts! (is-ok (as-contract (contract-call? .satoshibles transfer auctionAssetId tx-sender auctionLastBidderAccount)))
             count
         )
-        (asserts! (is-ok (as-contract (stx-transfer? (- auctionLastBidAmount reserveAmount) tx-sender LIQUIDIUM_ACCOUNT))) ;; leave loan principal in contract and send extra to LIQUIDIUM_ACCOUNT
+        (asserts! (is-ok (as-contract (stx-transfer? (- auctionLastBidAmount reserveAmount) tx-sender LIQUIDIUM_PROFITS))) ;; leave loan principal in contract and send extra to LIQUIDIUM_PROFITS
             count
         )
         (var-set tempUint auctionId)
@@ -331,11 +330,11 @@
         (
             (values
                 {
-                    loanToAssetRatio: loanToAssetRatio,
-                    loanLiquidationThreshhold: loanLiquidationThreshhold,
-                    loanFeeRate: loanFeeRate,
-                    loanTermLengthMin: loanTermLengthMin,
-                    loanTermLengthMax: loanTermLengthMax,
+                    loanToAssetRatio: (var-get loanToAssetRatio),
+                    loanLiquidationThreshhold: (var-get loanLiquidationThreshhold),
+                    loanFeeRate: (var-get loanFeeRate),
+                    loanTermLengthMin: (var-get loanTermLengthMin),
+                    loanTermLengthMax: (var-get loanTermLengthMax),
                 }
             )
         )
@@ -348,8 +347,8 @@
         (
             (values
                 {
-                    auctionDuration: auctionDuration,
-                    loanTermInterestRates: loanTermInterestRates,
+                    auctionDuration: (var-get auctionDuration),
+                    loanTermInterestRates: (var-get loanTermInterestRates),
                     assetFloor: (var-get assetFloor),
                     loanAmountMax: (var-get loanAmountMax),
                     loanLiquidationValue: (var-get loanLiquidationValue)
@@ -424,7 +423,7 @@
                     reserveAmount: auctionReserveAmount,
                     lastBidAmount: amount,
                     lastBidderAccount: (some bidderAccount),
-                    endAt: (some (+ block-height auctionDuration)),
+                    endAt: (some (+ block-height (var-get auctionDuration))),
                 }
             )
             (asserts! (>= (stx-get-balance bidderAccount) amount)
@@ -516,11 +515,11 @@
             )
             (if (> loanDebtBalance loanPrincipal) ;; if interest is still due
                 (if (>= (- loanDebtBalance loanPrincipal) paymentAmount) ;; if interest due is greater than payment amount
-                    (asserts! (is-ok (stx-transfer? paymentAmount borrowerAccount LIQUIDIUM_ACCOUNT)) ;; then pay part of interest due with all paymentAmount to LIQM ACCOUNT
+                    (asserts! (is-ok (stx-transfer? paymentAmount borrowerAccount LIQUIDIUM_PROFITS)) ;; then pay part of interest due with all paymentAmount to LIQM ACCOUNT
                         ERR_STX_TRANSFER_FAILED 
                     )
                     (begin
-                        (asserts! (is-ok (stx-transfer? (- loanDebtBalance loanPrincipal) borrowerAccount LIQUIDIUM_ACCOUNT)) ;; else send rest of interest due to LIQM ACCOUNT
+                        (asserts! (is-ok (stx-transfer? (- loanDebtBalance loanPrincipal) borrowerAccount LIQUIDIUM_PROFITS)) ;; else send rest of interest due to LIQM ACCOUNT
                             ERR_STX_TRANSFER_FAILED
                         )
                         (asserts! (is-ok (stx-transfer? (- paymentAmount (- loanDebtBalance loanPrincipal)) borrowerAccount (as-contract tx-sender)))
@@ -541,8 +540,7 @@
                     (var-set tempUint loanId)
                     (var-set activeLoanIds (filter not-tempUint (var-get activeLoanIds)))
                     (map-set Borrower borrowerAccount (filter not-tempUint borrowerActiveLoanIds))
-                    ;; (unwrap! (as-contract (contract-call? 'SP3D6PV2ACBPEKYJTCMH7HEN02KP87QSP8KTEH335.megapont-ape-club-nft transfer loanAssetId tx-sender borrowerAccount)) ERR_ASSET_TRANSFER_FAILED)
-                    (unwrap! (as-contract (contract-call? .megapont-ape-club-nft transfer loanAssetId tx-sender borrowerAccount)) ERR_ASSET_TRANSFER_FAILED)
+                    (unwrap! (as-contract (contract-call? .satoshibles transfer loanAssetId tx-sender borrowerAccount)) ERR_ASSET_TRANSFER_FAILED)
                     (ok true)
                 )
                 (ok true)
@@ -553,8 +551,7 @@
 
 (define-public (new-loan (assetId uint) (amount uint) (termLength uint))
     (begin
-        ;; (asserts! (is-eq (ok (some tx-sender)) (contract-call? 'SP3D6PV2ACBPEKYJTCMH7HEN02KP87QSP8KTEH335.megapont-ape-club-nft get-owner assetId))
-        (asserts! (is-eq (ok (some tx-sender)) (contract-call? .megapont-ape-club-nft get-owner assetId))
+        (asserts! (is-eq (ok (some tx-sender)) (contract-call? .satoshibles get-owner assetId))
             ERR_ASSET_NOT_OWNED
         )
         (asserts! (<= amount (var-get loanAmountMax))
@@ -562,8 +559,8 @@
         )
         (asserts!
             (and
-                (>= termLength loanTermLengthMin)
-                (<= termLength loanTermLengthMax)
+                (>= termLength (var-get loanTermLengthMin))
+                (<= termLength (var-get loanTermLengthMax))
             )
             ERR_TERM_INVALID
         )
@@ -587,17 +584,17 @@
                 (loanTermInterestRate
                     (begin
                         (var-set tempUint termLength)
-                        (fold term-interest-rate loanTermInterestRates u0)
+                        (fold term-interest-rate (var-get loanTermInterestRates) u0)
                     )
                 )
                 (loanFeeAmount
-                    (/ (* amount loanFeeRate) u10000)
+                    (/ (* amount (var-get loanFeeRate)) u10000)
                 )
                 (interestAmountPerPeriod
                     (/ (* amount loanTermInterestRate) u10000)
                 )
                 (interestAmount
-                    (/ (* interestAmountPerPeriod termLength) loanTermLengthMax)
+                    (/ (* interestAmountPerPeriod termLength) (var-get loanTermLengthMax))
                 )
                 (debtBalance
                     (+ amount interestAmount)
@@ -606,14 +603,13 @@
                     (var-get vaultLendingLiquidity)
                 )
             )
-            ;; (asserts! (is-ok (contract-call? 'SP3D6PV2ACBPEKYJTCMH7HEN02KP87QSP8KTEH335.megapont-ape-club-nft transfer assetId borrowerAccount (as-contract tx-sender)))
-            (asserts! (is-ok (contract-call? .megapont-ape-club-nft transfer assetId borrowerAccount (as-contract tx-sender)))
+            (asserts! (is-ok (contract-call? .satoshibles transfer assetId borrowerAccount (as-contract tx-sender)))
                 ERR_ASSET_TRANSFER_FAILED
             )
             (asserts! (>= (stx-get-balance borrowerAccount) loanFeeAmount)
                 ERR_STX_TRANSFER_FAILED
             )
-            (asserts! (is-ok (stx-transfer? loanFeeAmount borrowerAccount LIQUIDIUM_ACCOUNT))
+            (asserts! (is-ok (stx-transfer? loanFeeAmount borrowerAccount LIQUIDIUM_PROFITS))
                 ERR_STX_TRANSFER_FAILED
             )
             (asserts! (>= availableLiquidity amount)
@@ -689,8 +685,8 @@
             (var-set assetFloorHistory (unwrap! (as-max-len? (append (filter remove-first currentHistory) amount) u10) ERR_ON_APPEND))
         )
         (var-set assetFloor (/ (fold + (var-get assetFloorHistory) u0) (len (var-get assetFloorHistory))))
-        (var-set loanAmountMax (/ (* loanToAssetRatio (var-get assetFloor)) u10000))
-        (var-set loanLiquidationValue (/ (* loanLiquidationThreshhold (var-get assetFloor)) u10000))
+        (var-set loanAmountMax (/ (* (var-get loanToAssetRatio) (var-get assetFloor)) u10000))
+        (var-set loanLiquidationValue (/ (* (var-get loanLiquidationThreshhold) (var-get assetFloor)) u10000))
         (ok (var-get assetFloor))
     )
 )
@@ -737,7 +733,7 @@
         (asserts! (and (> amount u0) (>= (stx-get-balance (as-contract tx-sender)) amount))
             ERR_AMOUNT_INVALID
         )
-        (asserts! (is-ok (as-contract (stx-transfer? amount tx-sender LIQUIDIUM_ACCOUNT)))
+        (asserts! (is-ok (as-contract (stx-transfer? amount tx-sender LIQUIDIUM)))
             ERR_STX_TRANSFER_FAILED
         )
         (var-set vaultLendingLiquidity (- (var-get vaultLendingLiquidity) amount))
@@ -745,13 +741,97 @@
     )
 )
 
-(define-public (withdrawl-megapont (id uint))
+(define-public (withdrawl-the-guests (id uint))
     (begin
         (asserts! (is-admin tx-sender)
             ERR_NOT_ALLOWED
         )
-        ;; (unwrap! (as-contract (contract-call? 'SP3D6PV2ACBPEKYJTCMH7HEN02KP87QSP8KTEH335.megapont-ape-club-nft transfer id tx-sender LIQUIDIUM_ACCOUNT)) ERR_ASSET_TRANSFER_FAILED)
-        (unwrap! (as-contract (contract-call? .megapont-ape-club-nft transfer id tx-sender LIQUIDIUM_ACCOUNT)) ERR_ASSET_TRANSFER_FAILED)
+        (unwrap! (as-contract (contract-call? .satoshibles transfer id tx-sender LIQUIDIUM_PROFITS)) ERR_ASSET_TRANSFER_FAILED)
+        (ok true)
+    )
+)
+
+(define-public (set-loanToAssetRatio (ratio uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (and (> ratio u0) (<= ratio u10000))
+            ERR_INPUT_INVALID
+        )
+        (var-set loanToAssetRatio ratio)
+        (var-set loanAmountMax (/ (* (var-get loanToAssetRatio) (var-get assetFloor)) u10000))
+        (ok true)
+    )
+)
+
+(define-public (set-loanLiquidationThreshhold (ratio uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (and (> ratio u0) (<= ratio u10000) (>= ratio (var-get loanToAssetRatio)))
+            ERR_INPUT_INVALID
+        )
+        (var-set loanLiquidationThreshhold ratio)
+        (var-set loanLiquidationValue (/ (* (var-get loanLiquidationThreshhold) (var-get assetFloor)) u10000))
+        (ok true)
+    )
+)
+
+(define-public (set-loanFeeRate (rate uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (and (> rate u0) (<= rate u500))
+            ERR_INPUT_INVALID
+        )
+        (var-set loanFeeRate rate)
+        (ok true)
+    )
+)
+
+(define-public (set-loanTermLengthMax (max uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (>= max (var-get loanTermLengthMin)) ERR_INPUT_INVALID)
+        (var-set loanTermLengthMax max)
+        (ok true)
+    )
+)
+
+(define-public (set-loanTermLengthMin (min uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (<= min (var-get loanTermLengthMax)) ERR_INPUT_INVALID)
+        (var-set loanTermLengthMin min)
+        (ok true)
+    )
+)
+
+(define-public (set-auctionDuration (duration uint))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (>= duration u0) ERR_INPUT_INVALID)
+        (var-set auctionDuration duration)
+        (ok true)
+    )
+)
+
+(define-public (set-loanTermInterestRates (rates (list 5 (tuple (interestRate uint) (termLengthMin uint)))))
+    (begin
+        (asserts! (is-admin tx-sender)
+            ERR_NOT_ALLOWED
+        )
+        (asserts! (is-eq (len rates) u5) ERR_INPUT_INVALID)
+        (var-set loanTermInterestRates rates)
         (ok true)
     )
 )
